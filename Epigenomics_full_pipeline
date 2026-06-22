@@ -1,0 +1,348 @@
+fastqc *.fastqc
+#!/bin/bash
+
+# Define where Trimmomatic is
+TRIMMOMATIC_JAR="trimmomatic-0.39.jar"   # Use this if .jar is in current directory
+# OR
+# TRIMMOMATIC_JAR="./trimmomatic-0.39.jar"  # Use this if you want ./ before it
+# OR
+# TRIMMOMATIC_JAR="Trimmomatic-0.39/trimmomatic-0.39.jar"  # Use this if it's in the folder
+
+# Adapter file (Nextera for ATAC-seq or Nextera-based libraries)
+ADAPTERS="./NexteraPE-PE.fa"
+
+# Output folder
+mkdir -p trimmed_output
+
+# Loop through R1 files and process matching R2 files
+for R1 in *_R1.fastq; do
+    # Skip if no files found
+    [ -e "$R1" ] || continue
+    
+    # Determine R2 file by replacing _R1 with _R2
+    R2="${R1/_R1/_R2}"
+    
+    # Check if R2 exists
+    if [ ! -f "$R2" ]; then
+        echo "??  Warning: No matching R2 file for $R1 — skipping"
+        continue
+    fi
+    
+    # Get base name (remove _R1.fastq)
+    BASENAME=$(basename "$R1" _R1.fastq)
+    
+    # Output files
+    R1_PAIRED="trimmed_output/${BASENAME}_R1_paired.fastq"
+    R1_UNPAIRED="trimmed_output/${BASENAME}_R1_unpaired.fastq"
+    R2_PAIRED="trimmed_output/${BASENAME}_R2_paired.fastq"
+    R2_UNPAIRED="trimmed_output/${BASENAME}_R2_unpaired.fastq"
+    
+    echo "?? Processing $BASENAME..."
+    echo "   R1: $R1"
+    echo "   R2: $R2"
+    
+    java -jar "$TRIMMOMATIC_JAR" PE -phred33 \
+        "$R1" "$R2" \
+        "$R1_PAIRED" "$R1_UNPAIRED" \
+        "$R2_PAIRED" "$R2_UNPAIRED" \
+        ILLUMINACLIP:"$ADAPTERS":2:30:10 \
+        LEADING:3 \
+        TRAILING:3 \
+        SLIDINGWINDOW:4:20 \
+        MINLEN:50
+    
+    echo "? Finished $BASENAME"
+done
+
+echo "?? All paired-end reads trimmed successfully!"
+#!/bin/bash
+
+# Create the index directory if it doesn't exist
+mkdir -p genome/index
+
+# Check if the genome file exists
+if [ ! -f "genome/chr22.fa" ]; then
+    echo "? Error: genome/chr22.fa not found!"
+    echo "   Please make sure the genome file is in the genome/ folder."
+    exit 1
+fi
+
+# Check if index already exists
+if [ -f "genome/index/chr22.1.bt2" ]; then
+    echo "??  Index already exists. Removing old index..."
+    rm -f genome/index/chr22*.bt2
+fi
+
+echo "?? Building Bowtie2 index for chr22..."
+echo "   Genome file: genome/chr22.fa"
+echo "   Index output: genome/index/chr22"
+
+# Build the index
+bowtie2-build genome/chr22.fa genome/index/chr22
+
+# Check if index was created successfully
+if [ -f "genome/index/chr22.1.bt2" ]; then
+    echo ""
+    echo "? Index built successfully!"
+    echo "   Index files created:"
+    ls -lh genome/index/chr22*.bt2
+else
+    echo ""
+    echo "? Index building failed!"
+    exit 1
+fi
+#!/bin/bash
+
+# Create output directory for alignments
+mkdir -p results/alignments
+
+# Check if Bowtie2 index exists
+if [ ! -f "genome/index/chr22.1.bt2" ]; then
+    echo "? Error: Bowtie2 index not found!"
+    echo "   Please run ./build_index.sh first."
+    exit 1
+fi
+
+# Check if trimmed reads exist
+if [ -z "$(ls -1 trimmed_output/*_R1_paired.fastq 2>/dev/null)" ]; then
+    echo "? Error: No trimmed paired-end reads found!"
+    echo "   Expected: trimmed_output/*_R1_paired.fastq"
+    echo "   Please run trimming first."
+    exit 1
+fi
+
+echo "?? Aligning all samples..."
+
+# Loop through all R1 paired files
+for R1 in trimmed_output/*_R1_paired.fastq; do
+    # Skip if no files found
+    [ -e "$R1" ] || continue
+    
+    # Determine R2 file by replacing _R1 with _R2
+    R2="${R1/_R1/_R2}"
+    
+    # Check if R2 exists
+    if [ ! -f "$R2" ]; then
+        echo "??  Warning: No matching R2 file for $R1 — skipping"
+        continue
+    fi
+    
+    # Get base name (remove _R1_paired.fastq)
+    BASENAME=$(basename "$R1" _R1_paired.fastq)
+    
+    echo ""
+    echo "?? Aligning $BASENAME..."
+    echo "   R1: $R1"
+    echo "   R2: $R2"
+    echo "   Output: results/alignments/${BASENAME}.sam"
+    
+    # Run Bowtie2 alignment
+    bowtie2 -x genome/index/chr22 \
+            -1 "$R1" \
+            -2 "$R2" \
+            -S "results/alignments/${BASENAME}.sam" \
+            --threads 4 2>&1 | tee "results/alignments/${BASENAME}.alignment.log"
+    
+    # Check if alignment succeeded
+    if [ -f "results/alignments/${BASENAME}.sam" ]; then
+        # Count alignments
+        ALIGN_COUNT=$(grep -v "^@" "results/alignments/${BASENAME}.sam" | wc -l)
+        echo "   ? Alignment complete for $BASENAME"
+        echo "   Alignment lines: $ALIGN_COUNT"
+        
+        # Show alignment summary from log
+        echo "   ?? Alignment summary:"
+        tail -5 "results/alignments/${BASENAME}.alignment.log" | sed 's/^/   /'
+    else
+        echo "   ? Alignment failed for $BASENAME!"
+        exit 1
+    fi
+done
+
+echo ""
+echo "?? All samples aligned successfully!"
+echo "   SAM files: results/alignments/*.sam"
+echo "   Log files: results/alignments/*.alignment.log"
+
+fi
+#!/bin/bash
+
+echo "?? Processing SRR891268 with Picard..."
+
+# Step 1: SAM ? BAM
+echo "   1. Converting SAM to BAM..."
+samtools view -bS results/alignments/SRR891268.sam -o results/alignments/SRR891268.bam
+
+# Step 2: Sort BAM
+echo "   2. Sorting BAM..."
+samtools sort results/alignments/SRR891268.bam -o results/alignments/SRR891268.sorted.bam
+
+# Step 3: Index sorted BAM
+echo "   3. Indexing sorted BAM..."
+samtools index results/alignments/SRR891268.sorted.bam
+
+# Step 4: Remove mitochondrial reads
+echo "   4. Removing mitochondrial reads..."
+samtools idxstats results/alignments/SRR891268.sorted.bam | cut -f1 | grep -v chrM | \
+    xargs samtools view -b results/alignments/SRR891268.sorted.bam > results/alignments/SRR891268.noM.bam
+samtools index results/alignments/SRR891268.noM.bam
+
+# Step 5: Remove duplicates with Picard (MORE RELIABLE!)
+echo "   5. Removing duplicates with Picard..."
+picard MarkDuplicates \
+    I=results/alignments/SRR891268.noM.bam \
+    O=results/alignments/SRR891268.dedup.bam \
+    M=results/alignments/SRR891268.dup_metrics.txt \
+    REMOVE_DUPLICATES=true
+
+# Step 6: Index dedup BAM
+echo "   6. Indexing dedup BAM..."
+samtools index results/alignments/SRR891268.dedup.bam
+
+# Step 7: Statistics
+echo "   7. Generating statistics..."
+samtools flagstat results/alignments/SRR891268.dedup.bam > results/alignments/SRR891268.stats.txt
+
+echo "? Done! Check results:"
+echo "   cat results/alignments/SRR891268.stats.txt"
+conda create -n macs2_env python=3.9 macs2=2.2.7.1 -c bioconda -c conda-forge
+conda activate macs2_env
+macs2 --version
+macs2 callpeak -t results/alignments/SRR891268.dedup.bam \
+               -f BAMPE \
+               -n SRR891268_chr22 \
+               --outdir peaks \
+               -q 0.05 \
+               --broad \
+               -g hs
+ awk '{print $1"\t"$2"\t"$3"\t"$4"\t"$5}' SRR891268_chr22_peaks.broadPeak > SRR891268_chr22_peaks.bed
+conda install -c bioconda bedtools
+wget https://hgdownload.soe.ucsc.edu/goldenPath/hg38/database/refGene.txt.gz
+gunzip refGene.txt.gz
+awk -F'\t' '{print $3"\t"$5"\t"$6"\t"$13}' refGene.txt | grep -w "^chr22" > genes_chr22.bed
+head -5 genes_chr22.bed
+awk -F'\t' '$1 == "22" && $3 == "gene"' Homo_sapiens.GRCh38.110.gtf | \
+    awk -F'\t' '{split($9,a,";"); split(a[1],b," "); print $1"\t"$4"\t"$5"\t"b[2]}' > genes_chr22.bed
+conda install -c bioconda gffread
+gffread -E Homo_sapiens.GRCh38.110.gtf -o genes_chr22.gff3
+sort -k1,1 -k2,2n genes_chr22.bed > genes_chr22_sorted.bed
+
+# Now run bedtools with the sorted file
+bedtools closest -a SRR891268_chr22_peaks.bed -b genes_chr22_sorted.bed > peaks_genes.txt
+# See how many lines were generated
+wc -l peaks_genes.txt
+# Look at the first 10 lines
+head -10 peaks_genes.txt
+# Check for any errors in the output
+tail -10 peaks_genes.txt
+#Run_motif
+conda install -c bioconda meme
+meme-chip -oc meme_results/ -meme-mod zoops -meme-minw 8 -meme-maxw 12 SRR891268_chr22_peaks.bed
+setwd("E:/")
+# Load libraries
+library(ggplot2)
+library(dplyr)
+
+# -------------------------------
+# 1. READ PEAKS FILE
+# -------------------------------
+peaks <- read.table("SRR891268_chr22_peaks.broadPeak", 
+                    header = FALSE, 
+                    sep = "\t",
+                    col.names = c("chr", "start", "end", "name", "score",
+                                  "strand", "fold_enrichment", "neg_log10_q", "summit"))
+
+# -------------------------------
+# 2. READ GENES FILE (AUTO-DETECTS COLUMNS)
+# -------------------------------
+# Read raw file
+genes_raw <- read.table("peaks_genes.txt", header = FALSE, sep = "\t", fill = TRUE)
+
+# Take only first 8 columns (peak info + gene info)
+genes <- genes_raw[, 1:8]
+
+# Assign column names
+colnames(genes) <- c("peak_chr", "peak_start", "peak_end", "peak_name",
+                     "gene_chr", "gene_start", "gene_end", "gene_name")
+
+# -------------------------------
+# 3. MERGE PEAKS WITH GENES
+# -------------------------------
+peaks_with_genes <- cbind(peaks, gene_name = genes$gene_name)
+
+# Check it worked
+head(peaks_with_genes)
+
+#############################################################################
+
+# Count how many peaks are near each gene
+gene_counts <- table(genes$gene_name)
+top_genes <- head(sort(gene_counts, decreasing = TRUE), 15)
+
+# Create data frame for plotting
+top_genes_df <- data.frame(
+  Gene = names(top_genes),
+  Count = as.numeric(top_genes)
+)
+
+# Plot
+ggplot(top_genes_df, aes(x = reorder(Gene, Count), y = Count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 15 Genes Near Open Chromatin Peaks (chr22)",
+       x = "Gene Name",
+       y = "Number of Peaks") +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Save plot
+ggsave("top_genes_chr22.png", width = 8, height = 6)
+
+#####################################################################
+
+# Histogram of peak scores
+ggplot(peaks, aes(x = score)) +
+  geom_histogram(bins = 20, fill = "darkgreen", color = "black") +
+  labs(title = "Distribution of Peak Scores",
+       x = "Peak Score",
+       y = "Count") +
+  theme_minimal()
+
+ggsave("peak_score_distribution.png", width = 6, height = 4)
+
+################################################################
+
+# Plot peaks as segments
+ggplot(peaks, aes(x = start/1e6, xend = end/1e6, 
+                  y = reorder(name, -score), 
+                  color = score)) +
+  geom_segment(size = 2) +
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(title = "Open Chromatin Peaks on Chromosome 22",
+       x = "Position on chr22 (Mb)",
+       y = "Peak Name",
+       color = "Score") +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+ggsave("peaks_chr22.png", width = 10, height = 6)
+
+######################################################################
+
+ggplot(peaks, aes(x = fold_enrichment, y = score)) +
+  geom_point(aes(color = fold_enrichment), size = 3) +
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(title = "Peak Score vs. Fold Enrichment",
+       x = "Fold Enrichment",
+       y = "Peak Score") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave("score_vs_enrichment.png", width = 6, height = 4)
